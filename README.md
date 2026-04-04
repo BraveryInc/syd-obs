@@ -1,5 +1,12 @@
 # Syd - Offline Penetration Testing Assistant
 
+
+###
+The goal of the Syd-Obs fork is to integrate the obsidian output functionality of mAIpper into Syd.  
+###
+
+
+
 ---
 
 ## Syd V3 Pro - Launching Next Week
