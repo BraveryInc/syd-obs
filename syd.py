@@ -4524,6 +4524,392 @@ RESPONSE FORMAT:
         self.txt_chat.see(tk.END)
 
 
+# ---------------------------- Report Builder (Obsidian Export) ----------------------------
+
+class ReportBuilderPage(ttk.Frame):
+    """
+    Report Builder — Obsidian vault export for Nmap scans.
+
+    Pulls scan data from the live NmapPage instance, optionally runs
+    Syd's Qwen LLM for analysis, then exports structured Obsidian
+    markdown notes and an additive canvas file.
+    """
+
+    MODEL_NAME = "Qwen 2.5 14B (Syd)"
+
+    def __init__(self, parent, nmap_page_ref=None):
+        super().__init__(parent)
+        self._nmap_page = nmap_page_ref          # live NmapPage reference
+        self._vault_dir = tk.StringVar(value="")
+        self._last_result: dict | None = None
+        self._export_thread = None
+
+        # ── Layout: left config panel + right log/status ──────────────────
+        left = ttk.Frame(self)
+        left.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=8)
+
+        right = ttk.Frame(self)
+        right.pack(side="right", fill="both", expand=True, padx=(4, 8), pady=8)
+
+        # ── LEFT: Configuration ───────────────────────────────────────────
+        ttk.Label(left, text="Obsidian Vault Export", style="Header.TLabel").pack(
+            anchor="w", pady=(0, 10)
+        )
+
+        # Vault directory picker
+        vault_frame = ttk.LabelFrame(left, text="Vault Directory", padding=10)
+        vault_frame.pack(fill="x", pady=(0, 8))
+
+        vault_entry = ttk.Entry(vault_frame, textvariable=self._vault_dir)
+        vault_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(vault_frame, text="Browse…", command=self._pick_vault).pack(side="left")
+
+        # Scan source selector
+        source_frame = ttk.LabelFrame(left, text="Scan Source", padding=10)
+        source_frame.pack(fill="x", pady=(0, 8))
+
+        self._source_var = tk.StringVar(value="current")
+        ttk.Radiobutton(
+            source_frame, text="Current Nmap scan (Raw Output tab)",
+            variable=self._source_var, value="current",
+            command=self._on_source_change,
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            source_frame, text="Nmap XML file on disk",
+            variable=self._source_var, value="xml",
+            command=self._on_source_change,
+        ).pack(anchor="w", pady=(4, 0))
+
+        # XML file picker (shown only when xml source is selected)
+        self._xml_frame = ttk.Frame(source_frame)
+        self._xml_frame.pack(fill="x", pady=(6, 0))
+        self._xml_path = tk.StringVar()
+        self._xml_entry = ttk.Entry(self._xml_frame, textvariable=self._xml_path, state="disabled")
+        self._xml_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._xml_btn = ttk.Button(
+            self._xml_frame, text="Browse…",
+            command=self._pick_xml, state="disabled"
+        )
+        self._xml_btn.pack(side="left")
+
+        # Analysis options
+        analysis_frame = ttk.LabelFrame(left, text="AI Analysis", padding=10)
+        analysis_frame.pack(fill="x", pady=(0, 8))
+
+        self._run_analysis = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            analysis_frame,
+            text="Generate Syd LLM analysis (Qwen 2.5 14B)",
+            variable=self._run_analysis,
+        ).pack(anchor="w")
+
+        ttk.Label(
+            analysis_frame,
+            text="Requires Nmap RAG to be loaded (check Nmap → Ask Syd log)",
+            foreground=INK_SOFT,
+        ).pack(anchor="w", pady=(4, 0))
+
+        # Export button
+        btn_row = ttk.Frame(left)
+        btn_row.pack(fill="x", pady=(8, 0))
+        self._btn_export = ttk.Button(
+            btn_row, text="Export to Obsidian Vault", command=self._on_export
+        )
+        self._btn_export.pack(side="left")
+        self._btn_open = ttk.Button(
+            btn_row, text="Open Vault Folder", command=self._open_vault_dir,
+            state="disabled"
+        )
+        self._btn_open.pack(side="left", padx=(8, 0))
+
+        # Status label
+        self._lbl_status = ttk.Label(left, text="Ready", foreground=INK_SOFT)
+        self._lbl_status.pack(anchor="w", pady=(8, 0))
+
+        # ── RIGHT: Export log ─────────────────────────────────────────────
+        ttk.Label(right, text="Export Log", style="Header.TLabel").pack(
+            anchor="w", pady=(0, 6)
+        )
+
+        log_frame = ttk.Frame(right)
+        log_frame.pack(fill="both", expand=True)
+
+        self._txt_log = tk.Text(
+            log_frame, bg=BG_DARK, fg=INK, insertbackground=INK,
+            wrap="word", font=("Consolas", 9), state="disabled"
+        )
+        scroll = ttk.Scrollbar(log_frame, command=self._txt_log.yview)
+        self._txt_log.configure(yscrollcommand=scroll.set)
+        self._txt_log.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        ttk.Button(right, text="Clear Log", command=self._clear_log).pack(
+            anchor="e", pady=(6, 0)
+        )
+
+        self._log("[INFO] Report Builder ready.")
+        self._log("[INFO] Select an Obsidian vault directory and click Export.")
+
+    # ── Logging ───────────────────────────────────────────────────────────
+
+    def _log(self, message: str) -> None:
+        """Append a timestamped message to the export log (thread-safe)."""
+        def _write():
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._txt_log.configure(state="normal")
+            self._txt_log.insert(tk.END, f"[{ts}] {message}\n")
+            self._txt_log.see(tk.END)
+            self._txt_log.configure(state="disabled")
+        self._txt_log.after(0, _write)
+
+    def _clear_log(self) -> None:
+        self._txt_log.configure(state="normal")
+        self._txt_log.delete("1.0", tk.END)
+        self._txt_log.configure(state="disabled")
+
+    def _set_status(self, text: str) -> None:
+        self._lbl_status.after(0, self._lbl_status.configure, {"text": text})
+
+    # ── UI helpers ────────────────────────────────────────────────────────
+
+    def _on_source_change(self) -> None:
+        if self._source_var.get() == "xml":
+            self._xml_entry.configure(state="normal")
+            self._xml_btn.configure(state="normal")
+        else:
+            self._xml_entry.configure(state="disabled")
+            self._xml_btn.configure(state="disabled")
+
+    def _pick_vault(self) -> None:
+        d = filedialog.askdirectory(title="Select Obsidian Vault Directory")
+        if d:
+            self._vault_dir.set(d)
+
+    def _pick_xml(self) -> None:
+        f = filedialog.askopenfilename(
+            title="Select Nmap XML file",
+            filetypes=[("Nmap XML", "*.xml"), ("All files", "*.*")],
+        )
+        if f:
+            self._xml_path.set(f)
+
+    def _open_vault_dir(self) -> None:
+        vault = self._vault_dir.get().strip()
+        if not vault or not Path(vault).exists():
+            messagebox.showwarning("Report Builder", "Vault directory not found.")
+            return
+        import subprocess, sys
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", vault])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", vault])
+        else:
+            subprocess.Popen(["xdg-open", vault])
+
+    # ── Data acquisition ──────────────────────────────────────────────────
+
+    def _get_scan_data(self):
+        """
+        Return (scan_data dict, scan_name str, xml_path str|None) or raise ValueError.
+        """
+        from obsidian_export import syd_services_to_scan_data
+
+        source = self._source_var.get()
+
+        if source == "xml":
+            xml_path = self._xml_path.get().strip()
+            if not xml_path or not Path(xml_path).exists():
+                raise ValueError("Please select a valid Nmap XML file.")
+
+            # Re-use Syd's existing XML parser from NmapPage
+            if self._nmap_page is None:
+                raise ValueError("Cannot access NmapPage reference.")
+
+            services = self._nmap_page.parse_xml_results(Path(xml_path))
+            nmap_args = ""
+            try:
+                import xml.etree.ElementTree as ET
+                root = ET.parse(xml_path).getroot()
+                nmap_args = root.get("args", "")
+            except Exception:
+                pass
+
+            scan_data = syd_services_to_scan_data(
+                services,
+                xml_path=xml_path,
+                scan_name=Path(xml_path).stem,
+                nmap_args=nmap_args,
+            )
+            return scan_data, Path(xml_path).stem, xml_path
+
+        else:  # "current"
+            if self._nmap_page is None:
+                raise ValueError("Cannot access NmapPage reference.")
+
+            raw_output = self._nmap_page.txtRawOutput.get("1.0", tk.END).strip()
+            if not raw_output or len(raw_output) < 50:
+                raise ValueError(
+                    "No scan data in Raw Output tab.\n"
+                    "Run or paste a scan first, or switch to 'XML file on disk'."
+                )
+
+            # Parse the raw text output using Syd's existing parser
+            services = self._nmap_page.parse_services_from_text(raw_output)
+            if not services:
+                raise ValueError(
+                    "Could not parse any services from Raw Output.\n"
+                    "Ensure the tab contains valid Nmap output."
+                )
+
+            # Try to grab XML path for nmap_args if a scan was run
+            xml_path = str(self._nmap_page.current_xml_file) \
+                if self._nmap_page.current_xml_file else None
+            nmap_args = ""
+            if xml_path and Path(xml_path).exists():
+                try:
+                    import xml.etree.ElementTree as ET
+                    root = ET.parse(xml_path).getroot()
+                    nmap_args = root.get("args", "")
+                except Exception:
+                    pass
+
+            scan_data = syd_services_to_scan_data(
+                services,
+                xml_path=xml_path,
+                scan_name="Nmap Scan",
+                nmap_args=nmap_args,
+            )
+            return scan_data, "Nmap Scan", xml_path
+
+    # ── LLM analysis ──────────────────────────────────────────────────────
+
+    def _run_llm_analysis(self, scan_data: dict) -> str | None:
+        """
+        Run analysis through Syd's Qwen instance (on NmapPage).
+        Blocks — call from a background thread.
+        """
+        if self._nmap_page is None or not self._nmap_page.rag_ready:
+            self._log("[WARNING] Syd LLM not ready — skipping analysis.")
+            return None
+
+        from obsidian_export import build_analysis_prompt
+
+        self._log("[LLM] Building analysis prompt…")
+        prompt = build_analysis_prompt(scan_data)
+
+        self._log("[LLM] Sending to Qwen 2.5 14B — this may take 30–90 seconds…")
+        try:
+            response = self._nmap_page.llm.create_chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Syd, an expert penetration tester. "
+                            "Produce clear, actionable, markdown-formatted analysis "
+                            "of Nmap scan results. Be precise and operator-focused."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=1024,
+                temperature=0.1,
+                top_p=0.9,
+                stop=["Question:", "Q:"],
+            )
+            analysis = response["choices"][0]["message"]["content"].strip()
+            self._log(f"[LLM] Analysis complete ({len(analysis)} chars).")
+            return analysis
+        except Exception as e:
+            self._log(f"[ERROR] LLM analysis failed: {e}")
+            return f"_LLM analysis failed: {e}_"
+
+    # ── Export pipeline ───────────────────────────────────────────────────
+
+    def _on_export(self) -> None:
+        vault = self._vault_dir.get().strip()
+        if not vault:
+            messagebox.showwarning("Report Builder", "Please select an Obsidian vault directory first.")
+            return
+
+        if self._export_thread and self._export_thread.is_alive():
+            messagebox.showinfo("Report Builder", "Export already in progress…")
+            return
+
+        self._btn_export.configure(state="disabled")
+        self._btn_open.configure(state="disabled")
+        self._set_status("Exporting…")
+        self._log("─" * 50)
+        self._log("[EXPORT] Starting Obsidian export…")
+
+        self._export_thread = threading.Thread(
+            target=self._export_worker,
+            args=(vault,),
+            daemon=True,
+        )
+        self._export_thread.start()
+
+    def _export_worker(self, vault_str: str) -> None:
+        """Background worker for the full export pipeline."""
+        try:
+            # ── 1. Get scan data ──────────────────────────────────────────
+            self._log("[1/4] Collecting scan data…")
+            try:
+                scan_data, scan_name, xml_path = self._get_scan_data()
+            except ValueError as e:
+                self._log(f"[ERROR] {e}")
+                self._set_status("Export failed — see log")
+                self._btn_export.after(0, self._btn_export.configure, {"state": "normal"})
+                return
+
+            total_hosts = len(scan_data.get("hosts", []))
+            self._log(f"[1/4] Collected {total_hosts} host(s) across scan.")
+
+            # ── 2. LLM analysis (optional) ────────────────────────────────
+            analysis_text  = None
+            model_name_out = None
+
+            if self._run_analysis.get():
+                self._log("[2/4] Running LLM analysis…")
+                analysis_text  = self._run_llm_analysis(scan_data)
+                model_name_out = self.MODEL_NAME if analysis_text else None
+            else:
+                self._log("[2/4] Skipping LLM analysis (disabled).")
+
+            # ── 3. Export vault ───────────────────────────────────────────
+            self._log("[3/4] Writing Obsidian notes…")
+            from obsidian_export import export_to_obsidian
+            vault_dir = Path(vault_str)
+            result = export_to_obsidian(
+                vault_dir   = vault_dir,
+                scan_data   = scan_data,
+                scan_name   = scan_name,
+                analysis_text = analysis_text,
+                model_name  = model_name_out,
+            )
+
+            # ── 4. Report results ─────────────────────────────────────────
+            self._log("[4/4] Export complete!")
+            self._log(f"  Vault:           {result['vault_dir']}")
+            self._log(f"  Scan note:       {Path(result['scan_note']).name}")
+            self._log(f"  Canvas:          {Path(result['canvas']).name}")
+            self._log(f"  Hosts created:   {result['hosts_created']}")
+            self._log(f"  Hosts updated:   {result['hosts_updated']}")
+            self._set_status(
+                f"Done — {result['hosts_created']} created, "
+                f"{result['hosts_updated']} updated"
+            )
+            self._last_result = result
+            self._btn_open.after(0, self._btn_open.configure, {"state": "normal"})
+
+        except Exception as e:
+            import traceback
+            self._log(f"[ERROR] Unexpected error: {e}")
+            self._log(traceback.format_exc())
+            self._set_status("Export failed — see log")
+        finally:
+            self._btn_export.after(0, self._btn_export.configure, {"state": "normal"})
+
+
 # ---------------------------- Main Window (Boilerplate) ----------------------------
 class App(tk.Tk):
     def __init__(self):
@@ -4537,9 +4923,11 @@ class App(tk.Tk):
 
         # Red Team notebook
         red_notebook = ttk.Notebook(main_notebook)
+        self._nmap_page = None  # will be set when Nmap tab is created
         for tool in RED_TOOLS:
             if tool == "Nmap":
                 page = NmapPage(red_notebook)
+                self._nmap_page = page
             elif tool == "BloodHound":
                 page = BloodHoundPage(red_notebook)
             else:
@@ -4560,7 +4948,10 @@ class App(tk.Tk):
         # Utilities notebook
         util_notebook = ttk.Notebook(main_notebook)
         for tool in UTILS:
-            page = GenericToolPage(util_notebook, tool)
+            if tool == "Report Builder":
+                page = ReportBuilderPage(util_notebook, nmap_page_ref=self._nmap_page)
+            else:
+                page = GenericToolPage(util_notebook, tool)
             util_notebook.add(page, text=tool)
         main_notebook.add(util_notebook, text="Utilities")
 
