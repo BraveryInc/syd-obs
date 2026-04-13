@@ -1,66 +1,337 @@
 """
 obsidian_export.py — Obsidian vault export module for Syd
 
+Synced from mAIpper-v0.6.py — Phase 1 & 2
+
 Converts Nmap scan data (from Syd's existing XML parser or paste parser)
-into structured Obsidian markdown notes with intelligent merge behavior:
+into structured Obsidian markdown notes and a canvas visualization.
 
-  - Host notes (Hosts/<ip>.md):
-      Merges new scan data into existing notes without clobbering manual
-      content written by the operator in the ## Notes section.
+What's new in this sync (v0.6 improvements):
+  - Host notes carry YAML frontmatter: ip, hostnames, status, tags, sources
+  - Re-runs merge new scan data; operator's 'status' and '## Operator Notes'
+    section are always preserved
+  - Canvas rebuilt as single pane of glass:
+      * Stable deterministic node IDs (hashlib.md5) — manual operator additions survive
+      * Campaign Overview text node (stats + key AI findings)
+      * Scan note file cards connected to the hosts they discovered
+      * Subnet group nodes (/24) containing color-coded host cards
+      * Next Steps text node drawn from AI analysis
 
-  - Scan notes (Scans/<name>.md):
-      Always overwritten — these are fully derived from a scan file.
-
-  - Canvas (Assessment Canvas.canvas):
-      Additive — only inserts NEW host nodes; preserves existing node
-      positions so manual Obsidian layout is not reset.
-
-LLM analysis is driven by Syd's existing Qwen instance rather than Ollama.
+Syd-specific interface (unchanged — syd.py imports these by name):
+  - syd_services_to_scan_data()  — converts Syd's flat services list to scan_data dict
+  - build_analysis_prompt()      — builds the LLM user-message prompt
+  - export_to_obsidian()         — main entry point called by the Report Builder UI
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import json
 import logging
+import math
 import re
-import uuid
-import datetime as dt
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Canvas layout defaults ───────────────────────────────────────────────────
 
-CANVAS_COLS     = 3
-CARD_W          = 360
-CARD_H          = 240
-GAP_X           = 120
-GAP_Y           = 120
-START_X         = 100
-START_Y         = 100
+# ============================================================
+# Constants
+# ============================================================
+
 CANVAS_FILENAME = "Assessment Canvas.canvas"
 
+# Obsidian canvas color strings mapped to operator status values.
+# Set 'status' in frontmatter inside Obsidian; mAIpper colors the card on next export.
+STATUS_COLORS: dict[str, str | None] = {
+    "not-started": None,   # default (white)
+    "in-progress":  "3",   # yellow
+    "done":         "4",   # green
+    "exploited":    "1",   # red
+    "blocked":      "6",   # purple
+}
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Sentinel separating auto-generated content from operator-written content
+OPERATOR_NOTES_SENTINEL = "## Operator Notes"
+OPERATOR_NOTES_HINT     = "_Add your own findings, observations, and next steps below._"
+
+# Canvas layout constants (pixels)
+CARD_W            = 360
+CARD_H            = 220
+CARD_GAP_X        = 60
+CARD_GAP_Y        = 60
+GROUP_PAD         = 60
+GROUP_LABEL_H     = 40
+SCAN_CARD_W       = 360
+SCAN_CARD_H       = 160
+OVERVIEW_W        = 720
+OVERVIEW_H        = 220
+NEXT_STEPS_W      = 640
+NEXT_STEPS_H      = 420
+GROUP_GAP         = 120
+ROW_GAP           = 120
+
+
+# ============================================================
+# Basic helpers
+# ============================================================
 
 def _safe_filename(s: str) -> str:
-    """Strip characters that are illegal in file/directory names."""
-    bad = '<>:"/\\|?*\n\r\t'
-    for ch in bad:
+    """Strip characters that are illegal in Obsidian / Windows filenames."""
+    for ch in '<>:"/\\|?*\n\r\t':
         s = s.replace(ch, "_")
     return s.strip().strip(".")
-
-
-def _new_node_id() -> str:
-    return f"host_{uuid.uuid4().hex[:12]}"
 
 
 def _ensure_md(name: str) -> str:
     return name if name.lower().endswith(".md") else f"{name}.md"
 
 
-# ── Data model conversion ─────────────────────────────────────────────────────
+def _stable_id(key: str) -> str:
+    """Return a deterministic 12-char hex ID derived from *key*."""
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+
+def _is_ipv4(value: str) -> bool:
+    return bool(value and _IPV4_RE.match(str(value).strip()))
+
+
+def _get_subnet_label(ip: str) -> str:
+    """Return the /24 network label for an IPv4 address."""
+    if not _is_ipv4(ip):
+        return "unknown"
+    parts = str(ip).split(".")
+    return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+
+
+# ============================================================
+# Frontmatter helpers
+# ============================================================
+
+def _fm_encode(v: object) -> str:
+    if isinstance(v, list):
+        return json.dumps(v, ensure_ascii=False)
+    if v is None:
+        return "null"
+    return str(v)
+
+
+def write_frontmatter(fm: dict) -> str:
+    """Render *fm* as a YAML frontmatter block (including delimiters)."""
+    lines = ["---"]
+    for k, v in fm.items():
+        lines.append(f"{k}: {_fm_encode(v)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def read_frontmatter(text: str) -> tuple[dict, str]:
+    """
+    Parse the leading YAML frontmatter from *text*.
+    Returns ``(frontmatter_dict, body)`` where *body* is everything after
+    the closing ``---``.  Returns ``({}, text)`` if no frontmatter is found.
+    """
+    if not text.startswith("---\n"):
+        return {}, text
+
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, text
+
+    fm_text = text[4:end]
+    body    = text[end + 5:]
+
+    fm: dict = {}
+    for line in fm_text.splitlines():
+        if ": " not in line and not line.endswith(":"):
+            continue
+        key, _, raw = line.partition(": ")
+        key = key.strip()
+        raw = raw.strip()
+        if not key:
+            continue
+        try:
+            fm[key] = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            fm[key] = raw if raw else None
+
+    return fm, body
+
+
+def extract_operator_notes(body: str) -> str:
+    """
+    Return operator-written content after OPERATOR_NOTES_SENTINEL.
+    Strips the hint line and leading/trailing blank lines.
+    """
+    idx = body.find(OPERATOR_NOTES_SENTINEL)
+    if idx == -1:
+        return ""
+
+    after = body[idx + len(OPERATOR_NOTES_SENTINEL):]
+    lines = after.splitlines()
+
+    content_lines: list[str] = []
+    past_hint = False
+    for line in lines:
+        if not past_hint and line.strip() in ("", OPERATOR_NOTES_HINT):
+            continue
+        past_hint = True
+        content_lines.append(line)
+
+    while content_lines and not content_lines[-1].strip():
+        content_lines.pop()
+
+    return "\n".join(content_lines)
+
+
+# ============================================================
+# Port tags & hints
+# ============================================================
+
+def get_tags_from_ports(open_ports: list) -> list[str]:
+    """Derive short service tags from an open-ports list for frontmatter."""
+    tags: set[str] = set()
+    port_nums = {p.get("port", 0) for p in open_ports}
+    svc_names = {(p.get("service", {}).get("name", "") or "").lower() for p in open_ports}
+
+    if port_nums & {80, 81, 443, 8000, 8080, 8443} or svc_names & {"http", "https", "http-proxy"}:
+        tags.add("web")
+    if 445 in port_nums or svc_names & {"microsoft-ds", "smb"}:
+        tags.add("smb")
+    if port_nums & {88, 464} or any("kerberos" in s for s in svc_names):
+        tags.add("kerberos")
+    if port_nums & {389, 636, 3268, 3269} or svc_names & {"ldap", "ldaps", "globalcatldap", "globalcatldapssl"}:
+        tags.add("ldap")
+    if 135 in port_nums or "msrpc" in svc_names:
+        tags.add("rpc")
+    if port_nums & {1433, 1434} or any("mssql" in s for s in svc_names):
+        tags.add("mssql")
+    if 3306 in port_nums or "mysql" in svc_names:
+        tags.add("mysql")
+    if 5432 in port_nums or any("postgres" in s for s in svc_names):
+        tags.add("postgres")
+    if 22 in port_nums or "ssh" in svc_names:
+        tags.add("ssh")
+    if 3389 in port_nums or "ms-wbt-server" in svc_names:
+        tags.add("rdp")
+    if port_nums & {5985, 5986} or any("winrm" in s for s in svc_names):
+        tags.add("winrm")
+    if 21 in port_nums or "ftp" in svc_names:
+        tags.add("ftp")
+    if 53 in port_nums or "domain" in svc_names:
+        tags.add("dns")
+    if port_nums & {161, 162} or "snmp" in svc_names:
+        tags.add("snmp")
+    if port_nums & {25, 465, 587} or svc_names & {"smtp", "smtps", "submission"}:
+        tags.add("smtp")
+    if 2049 in port_nums or "nfs" in svc_names:
+        tags.add("nfs")
+    if 6379 in port_nums or any("redis" in s for s in svc_names):
+        tags.add("redis")
+
+    if {"kerberos", "ldap", "smb"} <= tags:
+        tags.add("domain-controller")
+
+    return sorted(tags)
+
+
+def _render_port_hints(port: int, service_name: str, product: str = "", extrainfo: str = "") -> list[str]:
+    """Return operator-facing hints for a given port/service."""
+    svc   = (service_name or "").lower()
+    prod  = (product or "").lower()
+    hints: list[str] = []
+
+    if port in (80, 81, 443, 8000, 8080, 8443) or svc in ("http", "https", "http-proxy"):
+        hints.append("Web service — consider: whatweb, nikto, gobuster/feroxbuster, curl, manual browsing")
+        hints.append("Check: default creds, admin panels, exposed APIs, vhosts, interesting headers")
+    if port == 445 or svc in ("microsoft-ds", "smb", "netbios-ssn"):
+        hints.append("SMB — consider: netexec smb, smbclient, smbmap, enum4linux-ng")
+        hints.append("Check: share access, null sessions, SMB signing, local admin reuse, domain membership")
+    if port in (88, 464) or "kerberos" in svc:
+        hints.append("Kerberos — consider: kerbrute, GetUserSPNs, AS-REP roast, netexec")
+    if port in (389, 636, 3268, 3269) or svc in ("ldap", "ldaps", "globalcatldap"):
+        hints.append("LDAP — consider: ldapsearch, netexec ldap, bloodyAD")
+        hints.append("Check: anonymous bind, naming contexts, domain structure, password policy")
+    if port == 135 or svc == "msrpc":
+        hints.append("MSRPC — consider: rpcclient, netexec, enumerate domain clues and services")
+    if port == 139 or svc == "netbios-ssn":
+        hints.append("NetBIOS — enumerate shares, names, and Windows host information")
+    if port in (5985, 5986) or "winrm" in svc:
+        hints.append("WinRM — consider: evil-winrm, netexec winrm (useful with creds)")
+    if port in (1433, 1434) or "mssql" in svc or "sql server" in prod:
+        hints.append("MSSQL — consider: impacket-mssqlclient, netexec mssql, xp_cmdshell if SA access")
+    if port == 3306 or "mysql" in svc:
+        hints.append("MySQL — test auth paths, enumerate databases, check for UDF injection")
+    if port == 5432 or "postgres" in svc:
+        hints.append("PostgreSQL — test for weak/default credentials and accessible databases")
+    if port == 22 or svc == "ssh":
+        hints.append("SSH — consider: ssh-audit, banner grab, key-based auth checks, cautious cred testing")
+    if port == 21 or svc == "ftp":
+        hints.append("FTP — check: anonymous access, writable dirs, plaintext credential exposure")
+    if port in (25, 465, 587) or svc in ("smtp", "smtps", "submission"):
+        hints.append("SMTP — consider: smtp-user-enum, swaks, open relay check")
+    if port == 53 or svc == "domain":
+        hints.append("DNS — consider: dig, dnsrecon, zone transfer testing")
+    if port == 3389 or svc == "ms-wbt-server":
+        hints.append("RDP — consider: netexec rdp, xfreerdp, NLA / domain clues")
+    if port == 2049 or svc == "nfs":
+        hints.append("NFS — use: showmount, test accessible exports and weak permissions")
+    if port in (161, 162) or svc == "snmp":
+        hints.append("SNMP — try: snmpwalk, onesixtyone, test common community strings")
+    if port in (5900, 5901, 5902) or svc == "vnc":
+        hints.append("VNC — verify auth requirements and assess screenshot / password attack viability")
+    if port == 6379 or "redis" in svc:
+        hints.append("Redis — verify bind/auth config and whether dangerous commands are exposed remotely")
+    if port in (9200, 9300) or "elasticsearch" in svc:
+        hints.append("Elasticsearch — check for unauthenticated cluster or index access")
+    if port in (2375, 2376) or "docker" in svc:
+        hints.append("Docker API — verify remote daemon access and authentication/TLS posture")
+
+    return hints
+
+
+# ============================================================
+# Host/port rendering helpers
+# ============================================================
+
+def _choose_display_name(host: dict) -> str:
+    hostnames = [h["name"].strip() for h in host.get("hostnames", []) if h.get("name")]
+    for hn in hostnames:
+        if "." in hn and not _IPV4_RE.match(hn):
+            return hn.rstrip(".")
+    for hn in hostnames:
+        if hn:
+            return hn.rstrip(".")
+    for addr in host.get("addresses", []):
+        if addr.get("addrtype") == "ipv4" and addr.get("addr"):
+            return addr["addr"]
+    return "unknown-host"
+
+
+def _primary_ipv4(host: dict) -> Optional[str]:
+    for addr in host.get("addresses", []):
+        if addr.get("addrtype") == "ipv4" and addr.get("addr"):
+            return addr["addr"]
+    return None
+
+
+def _render_service_str(port_info: dict) -> str:
+    svc   = port_info.get("service", {})
+    parts = [svc.get("name", "")]
+    if svc.get("product"):   parts.append(svc["product"])
+    if svc.get("version"):   parts.append(svc["version"])
+    if svc.get("extrainfo"): parts.append(f"({svc['extrainfo']})")
+    return " ".join(p for p in parts if p).strip() or "—"
+
+
+# ============================================================
+# Syd-specific data model conversion (unchanged)
+# ============================================================
 
 def syd_services_to_scan_data(
     services: list[dict],
@@ -75,21 +346,19 @@ def syd_services_to_scan_data(
     Syd service dict keys:
         host, hostname, port, protocol, service, product, version, extra_info
 
-    Output mirrors mAIpper's parse_nmap_xml() return value so
-    build_analysis_prompt() and create_obsidian_vault() can consume it directly.
+    Output mirrors mAIpper's parse_nmap_xml() return value.
     """
-    # Group services by host IP
     host_map: dict[str, dict] = {}
 
     for svc in services:
-        ip = svc.get("host", "unknown")
+        ip       = svc.get("host", "unknown")
         hostname = svc.get("hostname", "")
 
         if ip not in host_map:
             host_map[ip] = {
-                "state": "up",
-                "addresses": [{"addr": ip, "addrtype": "ipv4"}],
-                "hostnames": [{"name": hostname, "type": "user"}] if hostname else [],
+                "state":      "up",
+                "addresses":  [{"addr": ip, "addrtype": "ipv4"}],
+                "hostnames":  [{"name": hostname, "type": "user"}] if hostname else [],
                 "open_ports": [],
             }
         elif hostname and not host_map[ip]["hostnames"]:
@@ -97,7 +366,7 @@ def syd_services_to_scan_data(
 
         host_map[ip]["open_ports"].append({
             "protocol": svc.get("protocol", "tcp"),
-            "port": int(svc.get("port", 0)),
+            "port":     int(svc.get("port", 0)),
             "service": {
                 "name":      svc.get("service", ""),
                 "product":   svc.get("product", ""),
@@ -108,7 +377,6 @@ def syd_services_to_scan_data(
             "scripts": [],
         })
 
-    # Sort ports within each host
     for hdata in host_map.values():
         hdata["open_ports"].sort(key=lambda p: (p["protocol"], p["port"]))
 
@@ -121,13 +389,14 @@ def syd_services_to_scan_data(
     }
 
 
-# ── Analysis prompt builder ───────────────────────────────────────────────────
+# ============================================================
+# Analysis prompt builder (called directly by syd.py)
+# ============================================================
 
 def build_analysis_prompt(scan_data: dict) -> str:
     """
-    Build the LLM prompt from scan_data.  Mirrors mAIpper's build_ollama_prompt
-    but targets Syd's chat_completion interface (system + user messages).
-    Returns the *user* message string; the system role is set in the caller.
+    Build the LLM user-message prompt from scan_data.
+    Targets Syd's chat_completion interface (caller sets the system role).
     """
     hosts = scan_data.get("hosts", [])
 
@@ -149,24 +418,19 @@ def build_analysis_prompt(scan_data: dict) -> str:
             continue
 
         for p in open_ports:
-            proto   = p.get("protocol", "")
-            port    = p.get("port", "")
-            svc     = p.get("service", {})
-            parts   = [svc.get("name", "unknown")]
+            svc   = p.get("service", {})
+            parts = [svc.get("name", "unknown")]
             if svc.get("product"):   parts.append(svc["product"])
             if svc.get("version"):   parts.append(svc["version"])
             if svc.get("extrainfo"): parts.append(f"({svc['extrainfo']})")
-            lines.append(f"  {proto}/{port}: {' '.join(parts).strip()}")
+            lines.append(f"  {p.get('protocol', '')}/{p.get('port', '')}: {' '.join(parts).strip()}")
 
             for script in p.get("scripts", [])[:3]:
-                out = (script.get("output", "") or "").strip()
-                out = " ".join(out.split())
+                out = " ".join((script.get("output", "") or "").split())
                 if len(out) > 220:
                     out = out[:217] + "..."
                 if out:
                     lines.append(f"    script:{script.get('id', '')} -> {out}")
-
-    scan_summary = "\n".join(lines)
 
     return f"""You are an experienced penetration tester analyzing Nmap scan results for a client engagement.
 
@@ -182,7 +446,7 @@ Priorities:
 
 Nmap Scan Summary
 =================
-{scan_summary}
+{chr(10).join(lines)}
 
 Return your response in markdown using exactly these sections:
 
@@ -201,108 +465,80 @@ Return your response in markdown using exactly these sections:
 """
 
 
-# ── Host note writing (merge-aware) ──────────────────────────────────────────
+# ============================================================
+# Host note writing (merge-aware, with frontmatter)
+# ============================================================
 
-_MANAGED_SECTIONS = {
-    "## Host Info",
-    "## Open Ports",
-    "## Scan References",
-}
-
-
-def _render_service_str(port_info: dict) -> str:
-    svc   = port_info.get("service", {})
-    parts = [svc.get("name", "")]
-    if svc.get("product"):   parts.append(svc["product"])
-    if svc.get("version"):   parts.append(svc["version"])
-    if svc.get("extrainfo"): parts.append(f"({svc['extrainfo']})")
-    return " ".join(p for p in parts if p).strip() or "—"
-
-
-def _render_port_hints(port: int, service_name: str, product: str = "", extrainfo: str = "") -> list[str]:
-    """Return operator hints for a given port/service (ported from mAIpper)."""
-    svc   = (service_name or "").lower()
-    prod  = (product or "").lower()
-    extra = (extrainfo or "").lower()
-    hints: list[str] = []
-
-    web_ports = {80, 81, 443, 8000, 8080, 8443}
-    if port in web_ports or svc in ("http", "https", "http-proxy"):
-        hints.append("Web service — consider: whatweb, nikto, gobuster/feroxbuster, curl, manual browsing")
-        hints.append("Check: default creds, admin panels, exposed APIs, vhosts, interesting headers")
-
-    if port == 445 or svc in ("microsoft-ds", "smb", "netbios-ssn"):
-        hints.append("SMB — consider: netexec smb, smbclient, smbmap, enum4linux-ng")
-        hints.append("Check: share access, null sessions, SMB signing, local admin reuse, domain membership")
-
-    if port in (88, 464) or "kerberos" in svc:
-        hints.append("Kerberos — consider: kerbrute, GetUserSPNs, AS-REP roast, netexec")
-
-    if port in (389, 636, 3268, 3269) or svc in ("ldap", "ldaps", "globalcatldap"):
-        hints.append("LDAP — consider: ldapsearch, netexec ldap, bloodyAD")
-        hints.append("Check: anonymous bind, naming contexts, domain structure, password policy")
-
-    if port == 135 or svc == "msrpc":
-        hints.append("MSRPC — consider: rpcclient, netexec, enumerate domain clues and services")
-
-    if port in (5985, 5986) or "winrm" in svc:
-        hints.append("WinRM — consider: evil-winrm, netexec winrm (useful with creds)")
-
-    if port in (1433, 1434) or "mssql" in svc or "sql server" in prod:
-        hints.append("MSSQL — consider: impacket-mssqlclient, netexec mssql, xp_cmdshell if SA access")
-
-    if port == 3306 or "mysql" in svc:
-        hints.append("MySQL — test auth paths, enumerate databases, check for UDF injection")
-
-    if port == 22 or svc == "ssh":
-        hints.append("SSH — consider: ssh-audit, banner grab, key-based auth checks, cautious cred testing")
-
-    if port == 21 or svc == "ftp":
-        hints.append("FTP — check: anonymous access, writable dirs, plaintext credential exposure")
-
-    if port in (25, 465, 587) or svc in ("smtp", "smtps", "submission"):
-        hints.append("SMTP — consider: smtp-user-enum, swaks, open relay check")
-
-    if port == 53 or svc == "domain":
-        hints.append("DNS — consider: dig, dnsrecon, zone transfer testing")
-
-    if port == 3389 or svc == "ms-wbt-server":
-        hints.append("RDP — consider: netexec rdp, xfreerdp, NLA / domain clues")
-
-    if port == 2049 or svc == "nfs":
-        hints.append("NFS — use: showmount, test accessible exports and weak permissions")
-
-    if port in (161, 162) or svc == "snmp":
-        hints.append("SNMP — try: snmpwalk, onesixtyone, test common community strings")
-
-    return hints
-
-
-def _build_host_note_sections(host: dict, scan_stem: str, scan_display: str) -> str:
+def _write_host_note(
+    hosts_dir: Path,
+    host: dict,
+    scan_stem: str,
+    scan_display: str,
+) -> tuple[str, str]:
     """
-    Build the managed sections of a host note as a string block.
-    These are the sections that Syd owns and will update on re-export.
+    Write or merge a host note.
+
+    On first write: creates the note with frontmatter, detailed port sections
+    with operator hints, and an empty Operator Notes section.
+
+    On re-export: reads existing frontmatter, preserves 'status' and the
+    operator's ## Operator Notes content, rebuilds all auto-generated sections
+    with the latest scan data merged in.
+
+    Returns (display_name, host_stem).
     """
-    display  = _choose_display_name(host)
-    ip       = _primary_ipv4(host) or "unknown"
-    ports    = host.get("open_ports", [])
+    display    = _choose_display_name(host)
+    host_stem  = _safe_filename(display)
+    host_path  = hosts_dir / _ensure_md(host_stem)
+    primary_ip = _primary_ipv4(host)
+    open_ports = host.get("open_ports", [])
 
-    lines = [
-        "## Host Info",
-        f"- **State:** {host.get('state', 'up')}",
-        f"- **IP:** {ip}",
-        f"- **Open Ports:** {len(ports)}",
-        "",
-        "## Open Ports",
-    ]
+    # ---- Read existing ----
+    existing_fm: dict = {}
+    existing_op_notes = ""
+    if host_path.exists():
+        old_text = host_path.read_text(encoding="utf-8")
+        existing_fm, old_body = read_frontmatter(old_text)
+        existing_op_notes = extract_operator_notes(old_body)
+        logger.debug(f"Merging host note: {host_path.name}")
+    else:
+        logger.debug(f"Creating host note: {host_path.name}")
 
-    if ports:
-        for p in ports:
+    # ---- Merge frontmatter ----
+    scan_source = f"{scan_display} - Nmap"
+    existing_sources: list = existing_fm.get("sources", [])
+    merged_sources = existing_sources if scan_source in existing_sources \
+        else existing_sources + [scan_source]
+
+    existing_hostnames: list = existing_fm.get("hostnames", [])
+    new_hostnames = [h["name"].strip() for h in host.get("hostnames", []) if h.get("name")]
+    merged_hostnames = existing_hostnames + [h for h in new_hostnames if h not in existing_hostnames]
+
+    new_tags = get_tags_from_ports(open_ports)
+    merged_tags = sorted(set(existing_fm.get("tags", [])) | set(new_tags))
+
+    fm = {
+        "ip":        primary_ip or existing_fm.get("ip"),
+        "hostnames": merged_hostnames,
+        "status":    existing_fm.get("status", "not-started"),
+        "tags":      merged_tags,
+        "sources":   merged_sources,
+    }
+
+    # ---- Build body ----
+    lines: list[str] = [f"**State:** {host.get('state', 'up')}"]
+    if primary_ip:
+        lines.append(f"**IP:** {primary_ip}")
+    lines.append(f"**Open Ports:** {len(open_ports)}")
+    lines += ["", "## Open Ports"]
+
+    if open_ports:
+        for p in open_ports:
             proto   = p.get("protocol", "tcp")
             port    = p.get("port", 0)
             svc_str = _render_service_str(p)
             lines.append(f"### {proto}/{port} — {svc_str}")
-            svc = p.get("service", {})
+            svc   = p.get("service", {})
             hints = _render_port_hints(
                 port,
                 svc.get("name", ""),
@@ -313,86 +549,26 @@ def _build_host_note_sections(host: dict, scan_stem: str, scan_display: str) -> 
                 lines.append(f"- {hint}")
             lines.append("")
     else:
-        lines += ["- None", ""]
+        lines += ["_No open ports detected._", ""]
 
-    lines += [
-        "## Scan References",
-        f"- [[Scans/{scan_stem}|{scan_display}]]",
-        "",
-    ]
+    lines += ["## Scan References"]
+    for src in merged_sources:
+        src_stem = _safe_filename(src)
+        lines.append(f"- [[Scans/{src_stem}|{src}]]")
 
-    return "\n".join(lines)
+    # Operator Notes — always last, always preserved
+    lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
+    if existing_op_notes:
+        lines += ["", existing_op_notes]
 
-
-def _write_host_note(host_path: Path, host: dict, scan_stem: str, scan_display: str) -> None:
-    """
-    Write or intelligently merge a host note.
-
-    Merge strategy:
-    - If file doesn't exist → write fresh, appending a blank ## Notes section
-    - If file exists:
-        - Replace managed sections (Host Info, Open Ports, Scan References)
-          with freshly generated content
-        - Preserve everything in ## Notes and any other operator-added sections
-        - Add a new scan reference to ## Scan References if not already present
-    """
-    managed_content = _build_host_note_sections(host, scan_stem, scan_display)
-
-    if not host_path.exists():
-        full_content = managed_content + "## Notes\n- \n"
-        host_path.write_text(full_content, encoding="utf-8")
-        logger.debug(f"Created new host note: {host_path}")
-        return
-
-    # ── File exists: merge ────────────────────────────────────────────────
-    existing = host_path.read_text(encoding="utf-8")
-
-    # Split into sections by ## heading
-    section_re = re.compile(r"^(## .+)$", re.MULTILINE)
-    splits     = section_re.split(existing)
-
-    # splits alternates: [pre-heading text, heading, content, heading, content ...]
-    # Collect sections we want to preserve (not managed)
-    preserved_sections: list[tuple[str, str]] = []  # (heading, content)
-    notes_found        = False
-    scan_ref_line      = f"- [[Scans/{scan_stem}|{scan_display}]]"
-
-    i = 1
-    while i < len(splits):
-        heading = splits[i].strip()
-        content = splits[i + 1] if i + 1 < len(splits) else ""
-        i += 2
-
-        if heading in _MANAGED_SECTIONS:
-            # We will regenerate these — but capture existing scan refs
-            # so we can merge them into the new Scan References section
-            if heading == "## Scan References":
-                for line in content.splitlines():
-                    line = line.strip()
-                    if line.startswith("- [[Scans/") and line not in [scan_ref_line]:
-                        # Preserve old scan references we don't already have
-                        pass  # handled below in managed_content rebuild
-            continue
-
-        # Preserve everything else (## Notes, custom sections, etc.)
-        preserved_sections.append((heading, content))
-        if heading == "## Notes":
-            notes_found = True
-
-    # Rebuild: managed sections first, then operator sections
-    result = managed_content
-    for heading, content in preserved_sections:
-        result += f"{heading}\n{content}"
-
-    # If there was no ## Notes section before, add one
-    if not notes_found:
-        result += "## Notes\n- \n"
-
-    host_path.write_text(result, encoding="utf-8")
-    logger.debug(f"Updated host note: {host_path}")
+    body = "\n".join(lines)
+    host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    return display, host_stem
 
 
-# ── Scan note writing ─────────────────────────────────────────────────────────
+# ============================================================
+# Scan note writing
+# ============================================================
 
 def _write_scan_note(
     scan_path: Path,
@@ -403,7 +579,6 @@ def _write_scan_note(
     model_name: Optional[str],
 ) -> None:
     """Scan notes are always overwritten — they are fully derived artifacts."""
-
     lines = [
         f"# {scan_display} — Nmap",
         "",
@@ -418,131 +593,325 @@ def _write_scan_note(
     for display, host_stem, host in host_entries:
         lines.append(f"### [[Hosts/{host_stem}|{display}]]")
         for p in host.get("open_ports", []):
-            svc_str = _render_service_str(p)
-            lines.append(f"- **{p['protocol']}/{p['port']}** — {svc_str}")
+            lines.append(f"- **{p['protocol']}/{p['port']}** — {_render_service_str(p)}")
         if not host.get("open_ports"):
             lines.append("- No open ports detected")
         lines.append("")
 
     lines += ["## Analysis", ""]
-
     if model_name:
         lines.append(f"_Model: {model_name}_\n")
-
     lines.append(analysis_text or "_No AI analysis generated._")
 
     scan_path.write_text("\n".join(lines), encoding="utf-8")
-    logger.info(f"Wrote scan note: {scan_path}")
+    logger.info(f"Wrote scan note: {scan_path.name}")
 
 
-# ── Canvas (additive) ─────────────────────────────────────────────────────────
+# ============================================================
+# Canvas node / edge constructors
+# ============================================================
 
-def update_canvas(vault_dir: Path, canvas_name: str = CANVAS_FILENAME) -> None:
+def _text_node(nid: str, text: str, x: int, y: int, w: int, h: int, color: str | None = None) -> dict:
+    n: dict = {"id": nid, "type": "text", "text": text, "x": x, "y": y, "width": w, "height": h}
+    if color:
+        n["color"] = color
+    return n
+
+
+def _file_node(nid: str, file: str, x: int, y: int, w: int, h: int, color: str | None = None) -> dict:
+    n: dict = {"id": nid, "type": "file", "file": file, "x": x, "y": y, "width": w, "height": h}
+    if color:
+        n["color"] = color
+    return n
+
+
+def _group_node(nid: str, label: str, x: int, y: int, w: int, h: int, color: str | None = None) -> dict:
+    n: dict = {"id": nid, "type": "group", "label": label, "x": x, "y": y, "width": w, "height": h}
+    if color:
+        n["color"] = color
+    return n
+
+
+def _edge(eid: str, from_id: str, to_id: str, label: str = "") -> dict:
+    e: dict = {
+        "id":       eid,
+        "fromNode": from_id,
+        "fromSide": "bottom",
+        "toNode":   to_id,
+        "toSide":   "top",
+    }
+    if label:
+        e["label"] = label
+    return e
+
+
+# ============================================================
+# Canvas content helpers
+# ============================================================
+
+def _read_host_fm(host_path: Path) -> dict:
+    try:
+        fm, _ = read_frontmatter(host_path.read_text(encoding="utf-8"))
+        return fm
+    except Exception:
+        return {}
+
+
+def _build_campaign_overview(
+    vault_dir: Path,
+    scan_host_map: dict,
+    all_analyses: list[tuple[str, str]],
+) -> str:
+    hosts_dir  = vault_dir / "Hosts"
+    host_notes = sorted(hosts_dir.glob("*.md")) if hosts_dir.exists() else []
+
+    total_hosts  = len(host_notes)
+    total_scans  = len(scan_host_map)
+    status_counts: dict[str, int] = {}
+    all_tags: set[str] = set()
+    total_ports  = 0
+
+    for hp in host_notes:
+        fm = _read_host_fm(hp)
+        status = fm.get("status", "not-started")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        all_tags.update(fm.get("tags", []))
+        try:
+            _, body = read_frontmatter(hp.read_text(encoding="utf-8"))
+            total_ports += sum(
+                1 for line in body.splitlines()
+                if line.strip().startswith("###") and "—" in line
+            )
+        except Exception:
+            pass
+
+    lines = [
+        "# Campaign Overview",
+        "",
+        f"**Hosts:** {total_hosts}  ·  **Scans:** {total_scans}  ·  **Open Ports:** {total_ports}",
+        "",
+    ]
+
+    if status_counts:
+        parts = [f"{k}: {v}" for k, v in sorted(status_counts.items())]
+        lines += [f"**Progress:** {' · '.join(parts)}", ""]
+
+    display_tags = sorted(all_tags - {"rpc"})
+    if display_tags:
+        lines += [f"**Services seen:** {', '.join(display_tags)}", ""]
+
+    if all_analyses:
+        text  = all_analyses[-1][1]
+        match = re.search(
+            r"##\s+Key Observations(.*?)(?=\n##\s|\Z)", text, re.DOTALL | re.IGNORECASE
+        )
+        if match:
+            bullets = [
+                l.strip() for l in match.group(1).splitlines()
+                if l.strip().startswith(("-", "*", "•"))
+            ][:4]
+            if bullets:
+                lines += ["**Key Findings:**"] + bullets
+
+    return "\n".join(lines)
+
+
+def _build_next_steps(all_analyses: list[tuple[str, str]], max_items: int = 14) -> str:
+    items: list[str] = []
+
+    for _name, text in all_analyses:
+        for section in ("Potential Attack Paths", "Enumeration Suggestions"):
+            match = re.search(
+                rf"##\s+{re.escape(section)}(.*?)(?=\n##\s|\Z)",
+                text, re.DOTALL | re.IGNORECASE,
+            )
+            if not match:
+                continue
+            for line in match.group(1).splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                cleaned = re.sub(r"^[-*•\d]+[.)]\s*", "", stripped).strip()
+                if cleaned and len(cleaned) > 12 and cleaned not in items:
+                    items.append(cleaned)
+                if len(items) >= max_items:
+                    break
+            if len(items) >= max_items:
+                break
+
+    if not items:
+        return "# Next Steps\n\n_Run an export with AI analysis enabled to populate next steps._"
+
+    return "# Next Steps\n\n" + "\n".join(f"- {item}" for item in items[:max_items])
+
+
+# ============================================================
+# Canvas layout engine
+# ============================================================
+
+def _group_dimensions(n_hosts: int, cols: int = 2) -> tuple[int, int]:
+    if n_hosts == 0:
+        return 300, 200
+    actual_cols = min(n_hosts, cols)
+    rows    = math.ceil(n_hosts / cols)
+    inner_w = actual_cols * CARD_W + (actual_cols - 1) * CARD_GAP_X
+    inner_h = rows * CARD_H + (rows - 1) * CARD_GAP_Y
+    return GROUP_PAD * 2 + inner_w, GROUP_PAD + GROUP_LABEL_H + inner_h + GROUP_PAD
+
+
+def build_canvas(
+    vault_dir: Path,
+    canvas_name: str,
+    scan_host_map: dict,
+    all_analyses: list[tuple[str, str]],
+    canvas_cols: int = 2,
+    max_groups_per_row: int = 3,
+) -> Path:
     """
-    Rebuild the canvas ensuring every host note has a node.
-    - Existing nodes are LEFT UNTOUCHED (positions preserved).
-    - New host notes get new nodes appended after the existing layout.
+    Build (or patch) the Obsidian Canvas file.
+
+    Layout (top → bottom):
+      1. Campaign Overview  — aggregated stats and key AI findings
+      2. Scan note cards    — one per processed scan
+      3. Subnet groups      — /24 groups containing color-coded host cards
+      4. Next Steps         — extracted action items from AI analysis
+
+    Nodes the operator added manually (IDs not managed here) are preserved.
     """
-    canvas_path = vault_dir / canvas_name
     hosts_dir   = vault_dir / "Hosts"
+    canvas_path = vault_dir / canvas_name
 
-    if not hosts_dir.exists():
-        logger.warning("Hosts directory does not exist — skipping canvas update")
-        return
-
-    # Load existing canvas if present
     existing_canvas: dict = {"nodes": [], "edges": []}
     if canvas_path.exists():
         try:
             existing_canvas = json.loads(canvas_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.warning(f"Could not parse existing canvas, will rebuild: {e}")
+        except Exception:
+            pass
 
-    existing_nodes   = existing_canvas.get("nodes", [])
-    existing_files   = {n["file"] for n in existing_nodes if n.get("type") == "file"}
+    managed_ids: set[str] = set()
+    our_nodes:   list[dict] = []
+    our_edges:   list[dict] = []
 
-    # Discover all current host notes
-    host_notes = sorted(hosts_dir.glob("*.md"))
+    # 1. Campaign Overview
+    ov_id = _stable_id("campaign_overview")
+    managed_ids.add(ov_id)
+    our_nodes.append(_text_node(
+        ov_id,
+        _build_campaign_overview(vault_dir, scan_host_map, all_analyses),
+        -(OVERVIEW_W // 2), -900, OVERVIEW_W, OVERVIEW_H,
+    ))
 
-    # Figure out which are new
-    new_notes = [
-        hp for hp in host_notes
-        if str(hp.relative_to(vault_dir)).replace("\\", "/") not in existing_files
-    ]
+    # 2. Scan cards
+    scan_stems    = list(scan_host_map.keys())
+    total_scan_w  = len(scan_stems) * SCAN_CARD_W + max(0, len(scan_stems) - 1) * CARD_GAP_X
+    scan_row_x0   = -(total_scan_w // 2)
+    scan_row_y    = -900 + OVERVIEW_H + 100
+    scan_node_ids: dict[str, str] = {}
 
-    if not new_notes:
-        logger.info("Canvas is up to date — no new host nodes to add")
-        # Still write back in case edges or other content was reset
-        canvas_path.write_text(
-            json.dumps(existing_canvas, indent=2), encoding="utf-8"
-        )
-        return
+    for i, scan_stem in enumerate(scan_stems):
+        sid = _stable_id(f"scan_{scan_stem}")
+        managed_ids.add(sid)
+        scan_node_ids[scan_stem] = sid
+        sx  = scan_row_x0 + i * (SCAN_CARD_W + CARD_GAP_X)
+        rel = f"Scans/{_ensure_md(scan_stem)}"
+        our_nodes.append(_file_node(sid, rel, sx, scan_row_y, SCAN_CARD_W, SCAN_CARD_H))
 
-    # Determine starting position for new nodes
-    # Find the rightmost column and bottom row of existing nodes
-    if existing_nodes:
-        max_x = max((n.get("x", 0) + n.get("width", CARD_W) for n in existing_nodes), default=START_X)
-        max_y = max((n.get("y", 0) for n in existing_nodes), default=START_Y)
-    else:
-        max_x = START_X
-        max_y = START_Y
+        eid = _stable_id(f"edge_overview_{sid}")
+        managed_ids.add(eid)
+        our_edges.append(_edge(eid, ov_id, sid))
 
-    # Lay out new nodes in rows starting after the existing block
-    # Count existing file nodes to determine column continuation
-    col_offset = len([n for n in existing_nodes if n.get("type") == "file"]) % CANVAS_COLS
+    # 3. Subnet groups
+    subnet_hosts: dict[str, list[tuple[str, Path]]] = {}
+    if hosts_dir.exists():
+        for hp in sorted(hosts_dir.glob("*.md")):
+            fm     = _read_host_fm(hp)
+            ip     = fm.get("ip")
+            subnet = _get_subnet_label(ip) if ip and _is_ipv4(str(ip)) else "unknown"
+            subnet_hosts.setdefault(subnet, []).append((hp.stem, hp))
 
-    new_nodes = []
-    for i, hp in enumerate(new_notes):
-        col = (col_offset + i) % CANVAS_COLS
-        row = (col_offset + i) // CANVAS_COLS
+    subnets = sorted(subnet_hosts.keys())
+    gdims   = [_group_dimensions(len(subnet_hosts[s]), canvas_cols) for s in subnets]
 
-        if existing_nodes:
-            # Append below existing content
-            x = START_X + col * (CARD_W + GAP_X)
-            y = max_y + CARD_H + GAP_Y + row * (CARD_H + GAP_Y)
-        else:
-            x = START_X + col * (CARD_W + GAP_X)
-            y = START_Y + row * (CARD_H + GAP_Y)
+    cur_y = scan_row_y + SCAN_CARD_H + ROW_GAP
+    group_positions: list[tuple[int, int]] = []
 
-        rel_file = str(hp.relative_to(vault_dir)).replace("\\", "/")
-        new_nodes.append({
-            "id":     _new_node_id(),
-            "type":   "file",
-            "file":   rel_file,
-            "x":      x,
-            "y":      y,
-            "width":  CARD_W,
-            "height": CARD_H,
-        })
-        logger.debug(f"New canvas node: {rel_file} at x={x}, y={y}")
+    for row_i in range(math.ceil(len(subnets) / max_groups_per_row) if subnets else 0):
+        start = row_i * max_groups_per_row
+        end   = min(start + max_groups_per_row, len(subnets))
+        row_total_w = sum(gdims[j][0] for j in range(start, end)) + (end - start - 1) * GROUP_GAP
+        row_height  = max((gdims[j][1] for j in range(start, end)), default=200)
+        x = -(row_total_w // 2)
+        for j in range(start, end):
+            group_positions.append((x, cur_y))
+            x += gdims[j][0] + GROUP_GAP
+        cur_y += row_height + ROW_GAP
 
-    existing_canvas["nodes"] = existing_nodes + new_nodes
-    canvas_path.write_text(json.dumps(existing_canvas, indent=2), encoding="utf-8")
-    logger.info(f"Canvas updated — added {len(new_nodes)} new node(s): {canvas_path}")
+    host_node_ids: dict[str, str] = {}
+
+    for i, subnet in enumerate(subnets):
+        if i >= len(group_positions):
+            break
+        gx, gy = group_positions[i]
+        gw, gh = gdims[i]
+        gid = _stable_id(f"subnet_{subnet}")
+        managed_ids.add(gid)
+        our_nodes.append(_group_node(gid, subnet, gx, gy, gw, gh))
+
+        for j, (host_stem, hp) in enumerate(subnet_hosts[subnet]):
+            col = j % canvas_cols
+            row = j // canvas_cols
+            hx  = gx + GROUP_PAD + col * (CARD_W + CARD_GAP_X)
+            hy  = gy + GROUP_PAD + GROUP_LABEL_H + row * (CARD_H + CARD_GAP_Y)
+            hid = _stable_id(f"host_{host_stem}")
+            managed_ids.add(hid)
+            host_node_ids[host_stem] = hid
+
+            fm    = _read_host_fm(hp)
+            color = STATUS_COLORS.get(fm.get("status", "not-started"))
+            rel   = f"Hosts/{_ensure_md(host_stem)}"
+            our_nodes.append(_file_node(hid, rel, hx, hy, CARD_W, CARD_H, color))
+
+    # Scan → host edges
+    for scan_stem, host_stems in scan_host_map.items():
+        sid = scan_node_ids.get(scan_stem)
+        if not sid:
+            continue
+        for host_stem in host_stems:
+            hid = host_node_ids.get(host_stem)
+            if not hid:
+                continue
+            eid = _stable_id(f"edge_{sid}_{hid}")
+            managed_ids.add(eid)
+            our_edges.append(_edge(eid, sid, hid))
+
+    # 4. Next Steps
+    ns_id = _stable_id("next_steps")
+    managed_ids.add(ns_id)
+    our_nodes.append(_text_node(
+        ns_id,
+        _build_next_steps(all_analyses),
+        -(NEXT_STEPS_W // 2), cur_y + 40,
+        NEXT_STEPS_W, NEXT_STEPS_H,
+        color="5",
+    ))
+
+    # Preserve operator-added nodes; replace our managed ones
+    preserved = [n for n in existing_canvas.get("nodes", []) if n.get("id") not in managed_ids]
+    canvas_path.write_text(
+        json.dumps({"nodes": preserved + our_nodes, "edges": our_edges}, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(
+        f"Canvas written: {canvas_path.name} "
+        f"({len(preserved) + len(our_nodes)} nodes, {len(our_edges)} edges, "
+        f"{len(preserved)} preserved)"
+    )
+    return canvas_path
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
-
-def _choose_display_name(host: dict) -> str:
-    hostnames = [h["name"].strip() for h in host.get("hostnames", []) if h.get("name")]
-    for hn in hostnames:
-        if "." in hn and not re.match(r"^\d+\.\d+\.\d+\.\d+$", hn):
-            return hn.rstrip(".")
-    for hn in hostnames:
-        if hn:
-            return hn.rstrip(".")
-    for addr in host.get("addresses", []):
-        if addr.get("addrtype") == "ipv4" and addr.get("addr"):
-            return addr["addr"]
-    return "unknown-host"
-
-
-def _primary_ipv4(host: dict) -> Optional[str]:
-    for addr in host.get("addresses", []):
-        if addr.get("addrtype") == "ipv4" and addr.get("addr"):
-            return addr["addr"]
-    return None
-
+# ============================================================
+# Main entry point (called by syd.py — signature must not change)
+# ============================================================
 
 def export_to_obsidian(
     vault_dir: Path,
@@ -555,68 +924,61 @@ def export_to_obsidian(
     """
     Full export pipeline:
       1. Create vault directory structure
-      2. Write/merge host notes
+      2. Write / merge host notes (frontmatter + Operator Notes preserved)
       3. Write scan note
-      4. Update canvas (additive)
+      4. Rebuild canvas (single pane of glass)
 
-    Returns a result dict with paths and counts for UI feedback.
+    Returns a result dict consumed by syd.py's Report Builder UI:
+      vault_dir, scan_note, canvas, hosts_created, hosts_updated, total_hosts
     """
-    logger.info(f"Starting Obsidian export to: {vault_dir}")
+    logger.info(f"Starting Obsidian export → {vault_dir}")
 
     vault_dir.mkdir(parents=True, exist_ok=True)
-    hosts_dir = vault_dir / "Hosts"
-    scans_dir = vault_dir / "Scans"
-    hosts_dir.mkdir(exist_ok=True)
-    scans_dir.mkdir(exist_ok=True)
+    (vault_dir / "Hosts").mkdir(exist_ok=True)
+    (vault_dir / "Scans").mkdir(exist_ok=True)
 
-    hosts       = scan_data.get("hosts", [])
-    host_entries: list[tuple[str, str, dict]] = []
+    hosts = scan_data.get("hosts", [])
 
-    # Derive scan display name and stem
+    scan_display = scan_name
     if len(hosts) == 1:
         scan_display = _choose_display_name(hosts[0])
-    else:
-        scan_display = scan_name
 
     scan_stem = _safe_filename(f"{scan_display} - Nmap")
-    scan_path = scans_dir / _ensure_md(scan_stem)
+    scan_path = vault_dir / "Scans" / _ensure_md(scan_stem)
 
-    hosts_written   = 0
-    hosts_updated   = 0
+    host_entries: list[tuple[str, str, dict]] = []
+    hosts_created = 0
+    hosts_updated = 0
 
     for host in hosts:
-        display   = _choose_display_name(host)
-        host_stem = _safe_filename(display)
-        host_path = hosts_dir / _ensure_md(host_stem)
-
-        existed = host_path.exists()
-        _write_host_note(host_path, host, scan_stem, scan_display)
-
+        host_path = vault_dir / "Hosts" / _ensure_md(_safe_filename(_choose_display_name(host)))
+        existed   = host_path.exists()
+        display, host_stem = _write_host_note(vault_dir / "Hosts", host, scan_stem, scan_display)
+        host_entries.append((display, host_stem, host))
         if existed:
             hosts_updated += 1
         else:
-            hosts_written += 1
-
-        host_entries.append((display, host_stem, host))
-        logger.debug(f"{'Updated' if existed else 'Created'} host note: {host_path.name}")
+            hosts_created += 1
 
     _write_scan_note(scan_path, scan_display, scan_data, host_entries, analysis_text, model_name)
 
-    update_canvas(vault_dir, canvas_name)
+    scan_host_map = {scan_stem: [stem for _, stem, _ in host_entries]}
+    all_analyses  = [(scan_display, analysis_text)] if analysis_text else []
+
+    build_canvas(vault_dir, canvas_name, scan_host_map, all_analyses)
 
     canvas_path = vault_dir / canvas_name
     result = {
-        "vault_dir":       str(vault_dir),
-        "scan_note":       str(scan_path),
-        "canvas":          str(canvas_path),
-        "hosts_created":   hosts_written,
-        "hosts_updated":   hosts_updated,
-        "total_hosts":     len(hosts),
+        "vault_dir":     str(vault_dir),
+        "scan_note":     str(scan_path),
+        "canvas":        str(canvas_path),
+        "hosts_created": hosts_created,
+        "hosts_updated": hosts_updated,
+        "total_hosts":   len(hosts),
     }
 
     logger.info(
-        f"Export complete — "
-        f"{hosts_written} host(s) created, {hosts_updated} updated, "
-        f"scan note at {scan_path.name}"
+        f"Export complete — {hosts_created} created, {hosts_updated} updated, "
+        f"scan note: {scan_path.name}"
     )
     return result
