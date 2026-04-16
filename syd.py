@@ -2638,6 +2638,11 @@ This will show bash command history without needing symbols!
             self.current_facts = facts
             self.current_facts_text = self.fact_extractor.facts_to_text(facts)
 
+            # === OBSIDIAN EXPORT HOOK ===
+            # To export these Volatility results to Obsidian, call:
+            #   from obsidian_export import export_volatility_to_obsidian
+            #   export_volatility_to_obsidian(vault_dir=Path("your/vault"), analysis_text=self.current_facts_text, target_host="hostname_or_ip", scan_name="Volatility")
+
             # Clear tree
             for item in self.tree_results.get_children():
                 self.tree_results.delete(item)
@@ -4117,6 +4122,11 @@ class BloodHoundPage(ttk.Frame):
                 from bloodhound_analyzer import BloodHoundAnalyzer
                 report, vulnerabilities = BloodHoundAnalyzer.analyze_bloodhound_output(json_content)
 
+            # === OBSIDIAN EXPORT HOOK ===
+            # To export these results to Obsidian, call:
+            #   from obsidian_export import export_bloodhound_to_obsidian
+            #   export_bloodhound_to_obsidian(vault_dir=Path("your/vault"), report_text=report, vulnerabilities=vulnerabilities, scan_name="BloodHound")
+
             # === NEW: Extract facts using fact extractor (mirrors Nmap architecture) ===
             if json_data and hasattr(self, 'fact_extractor'):
                 try:
@@ -4194,6 +4204,11 @@ class BloodHoundPage(ttk.Frame):
             # Analyze with BloodHound analyzer
             from bloodhound_analyzer import BloodHoundAnalyzer
             report, vulnerabilities = BloodHoundAnalyzer.analyze_bloodhound_output(pasted)
+
+            # === OBSIDIAN EXPORT HOOK ===
+            # To export these results to Obsidian, call:
+            #   from obsidian_export import export_bloodhound_to_obsidian
+            #   export_bloodhound_to_obsidian(vault_dir=Path("your/vault"), report_text=report, vulnerabilities=vulnerabilities, scan_name="BloodHound")
 
             # === NEW: Extract facts using fact extractor (mirrors Nmap architecture) ===
             if json_data and hasattr(self, 'fact_extractor'):
