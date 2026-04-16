@@ -68,6 +68,8 @@ SCAN_CARD_W       = 360
 SCAN_CARD_H       = 160
 OVERVIEW_W        = 720
 OVERVIEW_H        = 220
+PRIORITY_TARGETS_W = 640
+PRIORITY_TARGETS_H = 320
 NEXT_STEPS_W      = 640
 NEXT_STEPS_H      = 420
 GROUP_GAP         = 120
@@ -436,13 +438,26 @@ def build_analysis_prompt(scan_data: dict) -> str:
 
 Produce practical, operator-focused analysis. Be concise and specific.
 
+GROUNDING RULES:
+- Do NOT invent CVEs, ports, IPs, or services not present in the scan data
+- Tag every claim: [CONFIRMED] if directly in scan data, [INFERRED] if reasonable conclusion, [ASSUMED] if needs verification
+- Say "insufficient data" instead of guessing; note this is a professional engagement where accuracy matters
+- For every tool suggestion, provide a ready-to-run example command with the actual target IP substituted
+
+ACTIVE DIRECTORY DETECTION:
+- If you observe Kerberos (port 88), LDAP (389/636), SMB (445), and DNS (53), explicitly identify this as an Active Directory environment
+- For AD environments, tailor recommendations to AD methodology: Kerberoasting, AS-REP roasting, BloodHound, Pass-the-Hash, enumeration via LDAP, etc.
+
+CROSS-HOST PATTERNS:
+- Identify network-wide patterns (e.g., SMB signing disabled on multiple hosts, consistent version mismatches)
+- Report network-wide findings once, not per-host
+
 Priorities:
 - Identify notable exposed services and the realistic attack surface
 - Suggest useful enumeration tools for discovered services (netexec, smbclient, ldapsearch, gobuster, etc.)
 - Recommend practical next-step commands or techniques
 - Highlight likely misconfigurations, risky exposures, or commonly exploitable weaknesses
 - Infer technology stacks where reasonable, but clearly separate facts from assumptions
-- Do NOT invent vulnerabilities not supported by the scan data
 
 Nmap Scan Summary
 =================
@@ -450,11 +465,17 @@ Nmap Scan Summary
 
 Return your response in markdown using exactly these sections:
 
+## Environment Assessment
+- State environment type (e.g., "Active Directory Domain", "Linux Web Servers", "Mixed Windows/Linux")
+- Confidence level: HIGH/MEDIUM/LOW
+- Supporting evidence from the scan
+
 ## Key Observations
 - Brief bullets of the most important findings
 
 ## Enumeration Suggestions
 - Group by service or host; include relevant tools and follow-up ideas
+- Include example commands with actual target IPs
 
 ## Potential Attack Paths
 - Realistic next steps or paths suggested by the scan
@@ -657,6 +678,67 @@ def _read_host_fm(host_path: Path) -> dict:
         return {}
 
 
+def _build_priority_targets(all_analyses: list[tuple[str, str]], vault_dir: Path) -> str:
+    """
+    Extract priority targets from analysis or rank hosts by tags.
+    Returns a markdown string starting with "## Priority Targets\n\n"
+    """
+    items: list[str] = []
+
+    # Strategy 1: Parse all_analyses for relevant sections
+    for _name, text in all_analyses:
+        for section in ("Attack Paths", "Exploitation Priority", "Priority Targets", "Key Observations"):
+            match = re.search(
+                rf"##\s+{re.escape(section)}(.*?)(?=\n##\s|\Z)",
+                text, re.DOTALL | re.IGNORECASE,
+            )
+            if not match:
+                continue
+            for line in match.group(1).splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                cleaned = re.sub(r"^[-*•\d]+[.)]\s*", "", stripped).strip()
+                if cleaned and len(cleaned) > 8 and cleaned not in items:
+                    items.append(cleaned)
+                if len(items) >= 8:
+                    break
+            if len(items) >= 8:
+                break
+
+    # Strategy 2: Fallback — rank hosts by tags
+    if not items:
+        hosts_dir = vault_dir / "Hosts"
+        host_ranking: list[tuple[str, int, list[str]]] = []
+
+        if hosts_dir.exists():
+            for hp in sorted(hosts_dir.glob("*.md")):
+                fm = _read_host_fm(hp)
+                tags = fm.get("tags", [])
+                ip = fm.get("ip", "unknown")
+
+                # Rank: domain-controller first, then rdp/smb/winrm, then by tag count
+                priority = 0
+                if "domain-controller" in tags:
+                    priority = 1000
+                elif any(t in tags for t in ["rdp", "smb", "winrm"]):
+                    priority = 500 + len(tags) * 10
+                else:
+                    priority = len(tags) * 10
+
+                host_ranking.append((ip, priority, tags))
+
+        host_ranking.sort(key=lambda x: -x[1])
+        for ip, _, tags in host_ranking[:8]:
+            tag_str = ", ".join(tags) if tags else "untagged"
+            items.append(f"{ip} — {tag_str}")
+
+    if not items:
+        items = ["_No priority targets identified._"]
+
+    return "## Priority Targets\n\n" + "\n".join(f"- {item}" for item in items[:8])
+
+
 def _build_campaign_overview(
     vault_dir: Path,
     scan_host_map: dict,
@@ -714,6 +796,31 @@ def _build_campaign_overview(
                 lines += ["**Key Findings:**"] + bullets
 
     return "\n".join(lines)
+
+
+def _read_existing_scan_host_map(vault_dir: Path) -> dict:
+    """
+    Read all Hosts/*.md files, parse their frontmatter sources list,
+    and build a {scan_stem: [host_stems]} dict.
+    """
+    scan_host_map: dict[str, list[str]] = {}
+    hosts_dir = vault_dir / "Hosts"
+
+    if not hosts_dir.exists():
+        return scan_host_map
+
+    for hp in sorted(hosts_dir.glob("*.md")):
+        fm = _read_host_fm(hp)
+        sources = fm.get("sources", [])
+
+        for source in sources:
+            source_stem = _safe_filename(source)
+            if source_stem not in scan_host_map:
+                scan_host_map[source_stem] = []
+            if hp.stem not in scan_host_map[source_stem]:
+                scan_host_map[source_stem].append(hp.stem)
+
+    return scan_host_map
 
 
 def _build_next_steps(all_analyses: list[tuple[str, str]], max_items: int = 14) -> str:
@@ -801,11 +908,22 @@ def build_canvas(
         -(OVERVIEW_W // 2), -900, OVERVIEW_W, OVERVIEW_H,
     ))
 
+    # 1.5. Priority Targets
+    pt_id = _stable_id("priority-targets")
+    managed_ids.add(pt_id)
+    pt_text = _build_priority_targets(all_analyses, vault_dir)
+    our_nodes.append(_text_node(
+        pt_id,
+        pt_text,
+        -(PRIORITY_TARGETS_W // 2), -900 + OVERVIEW_H + 100, PRIORITY_TARGETS_W, PRIORITY_TARGETS_H,
+        color="2",
+    ))
+
     # 2. Scan cards
     scan_stems    = list(scan_host_map.keys())
     total_scan_w  = len(scan_stems) * SCAN_CARD_W + max(0, len(scan_stems) - 1) * CARD_GAP_X
     scan_row_x0   = -(total_scan_w // 2)
-    scan_row_y    = -900 + OVERVIEW_H + 100
+    scan_row_y    = -900 + OVERVIEW_H + PRIORITY_TARGETS_H + 200
     scan_node_ids: dict[str, str] = {}
 
     for i, scan_stem in enumerate(scan_stems):
@@ -819,6 +937,11 @@ def build_canvas(
         eid = _stable_id(f"edge_overview_{sid}")
         managed_ids.add(eid)
         our_edges.append(_edge(eid, ov_id, sid))
+
+    # Edge from Overview to Priority Targets
+    eid_ov_pt = _stable_id("edge_overview_priority_targets")
+    managed_ids.add(eid_ov_pt)
+    our_edges.append(_edge(eid_ov_pt, ov_id, pt_id))
 
     # 3. Subnet groups
     subnet_hosts: dict[str, list[tuple[str, Path]]] = {}
@@ -834,6 +957,7 @@ def build_canvas(
 
     cur_y = scan_row_y + SCAN_CARD_H + ROW_GAP
     group_positions: list[tuple[int, int]] = []
+    group_node_ids: dict[str, str] = {}
 
     for row_i in range(math.ceil(len(subnets) / max_groups_per_row) if subnets else 0):
         start = row_i * max_groups_per_row
@@ -855,7 +979,13 @@ def build_canvas(
         gw, gh = gdims[i]
         gid = _stable_id(f"subnet_{subnet}")
         managed_ids.add(gid)
+        group_node_ids[subnet] = gid
         our_nodes.append(_group_node(gid, subnet, gx, gy, gw, gh))
+
+        # Edge from Priority Targets to each subnet group
+        eid = _stable_id(f"edge_priority_targets_{gid}")
+        managed_ids.add(eid)
+        our_edges.append(_edge(eid, pt_id, gid))
 
         for j, (host_stem, hp) in enumerate(subnet_hosts[subnet]):
             col = j % canvas_cols
@@ -868,6 +998,22 @@ def build_canvas(
 
             fm    = _read_host_fm(hp)
             color = STATUS_COLORS.get(fm.get("status", "not-started"))
+
+            # Apply nessus_max_severity coloring if status is not-started and severity is set
+            if color is None and fm.get("status", "not-started") == "not-started":
+                severity = fm.get("nessus_max_severity")
+                if severity is not None:
+                    try:
+                        sev_val = int(severity) if isinstance(severity, (int, str)) else 0
+                        if sev_val >= 4:
+                            color = "1"  # red
+                        elif sev_val >= 3:
+                            color = "5"  # orange
+                        elif sev_val >= 2:
+                            color = "3"  # yellow
+                    except (ValueError, TypeError):
+                        pass
+
             rel   = f"Hosts/{_ensure_md(host_stem)}"
             our_nodes.append(_file_node(hid, rel, hx, hy, CARD_W, CARD_H, color))
 
@@ -907,6 +1053,331 @@ def build_canvas(
         f"{len(preserved)} preserved)"
     )
     return canvas_path
+
+
+# ============================================================
+# BloodHound export
+# ============================================================
+
+def export_bloodhound_to_obsidian(
+    vault_dir: Path,
+    report_text: str,
+    vulnerabilities: Optional[dict] = None,
+    scan_name: str = "BloodHound",
+    model_name: Optional[str] = None,
+) -> dict:
+    """
+    Export BloodHound analysis results to Obsidian vault.
+
+    - Creates Scans/<scan_stem>.md with report_text and vulnerability tables
+    - Creates/updates host notes for hosts mentioned in attack paths
+    - Rebuilds canvas with BloodHound scan card included
+    """
+    logger.info(f"Starting BloodHound export → {vault_dir}")
+
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    (vault_dir / "Hosts").mkdir(exist_ok=True)
+    (vault_dir / "Scans").mkdir(exist_ok=True)
+
+    scan_stem = _safe_filename(f"{scan_name} - BloodHound")
+    scan_path = vault_dir / "Scans" / _ensure_md(scan_stem)
+
+    # Build scan note with vulnerability tables
+    lines = [
+        f"# {scan_name} — BloodHound Analysis",
+        "",
+        f"- **Scan:** {scan_name}",
+        f"- **Parsed:** {dt.datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "## Analysis Report",
+        "",
+    ]
+
+    if model_name:
+        lines.append(f"_Model: {model_name}_\n")
+
+    lines.append(report_text)
+
+    if vulnerabilities:
+        # Add attack paths table
+        if "attack_paths" in vulnerabilities and vulnerabilities["attack_paths"]:
+            lines += ["", "## Attack Paths", ""]
+            lines.append("| Source | Relationship | Target | Risk |")
+            lines.append("|--------|--------------|--------|------|")
+            for path in vulnerabilities["attack_paths"]:
+                source = path.get("source", "—")
+                rel = path.get("relationship", "—")
+                target = path.get("target", "—")
+                risk = path.get("risk", "—")
+                lines.append(f"| {source} | {rel} | {target} | {risk} |")
+
+        # Add property vulnerabilities table
+        if "property_vulns" in vulnerabilities and vulnerabilities["property_vulns"]:
+            lines += ["", "## Property Vulnerabilities", ""]
+            lines.append("| Type | Account | Details |")
+            lines.append("|------|---------|---------|")
+            for vuln in vulnerabilities["property_vulns"]:
+                vuln_type = vuln.get("type", "—")
+                account = vuln.get("account", "—")
+                details = vuln.get("details", "—")
+                lines.append(f"| {vuln_type} | {account} | {details} |")
+
+    scan_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info(f"Wrote BloodHound scan note: {scan_path.name}")
+
+    # Extract host names from attack paths
+    hosts_dir = vault_dir / "Hosts"
+    unique_hosts: set[str] = set()
+
+    if vulnerabilities and "attack_paths" in vulnerabilities:
+        for path in vulnerabilities["attack_paths"]:
+            for field in ["source", "target"]:
+                entry = path.get(field, "")
+                # Skip SIDs, group names; keep computer names, FQDNs, IPs
+                if entry and not entry.startswith("S-") and "@" not in entry:
+                    if "$" in entry or "." in entry or _is_ipv4(entry):
+                        unique_hosts.add(entry)
+
+    hosts_created = 0
+    hosts_updated = 0
+
+    # Create/update host notes
+    for host_entry in unique_hosts:
+        host_stem = _safe_filename(host_entry)
+        host_path = hosts_dir / _ensure_md(host_stem)
+        existed = host_path.exists()
+
+        # Read existing frontmatter
+        existing_fm: dict = {}
+        existing_op_notes = ""
+        if existed:
+            old_text = host_path.read_text(encoding="utf-8")
+            existing_fm, old_body = read_frontmatter(old_text)
+            existing_op_notes = extract_operator_notes(old_body)
+
+        # Merge frontmatter
+        merged_sources = existing_fm.get("sources", [])
+        if scan_name not in merged_sources:
+            merged_sources = merged_sources + [scan_name]
+
+        fm = {
+            "ip": existing_fm.get("ip"),
+            "hostnames": existing_fm.get("hostnames", [host_entry]),
+            "status": existing_fm.get("status", "not-started"),
+            "tags": existing_fm.get("tags", ["bloodhound"]),
+            "sources": merged_sources,
+        }
+
+        # Add bloodhound tag if not present
+        if "bloodhound" not in fm["tags"]:
+            fm["tags"] = sorted(set(fm["tags"]) | {"bloodhound"})
+
+        # Build body with BloodHound findings
+        bloodhound_findings: list[str] = []
+        if vulnerabilities and "attack_paths" in vulnerabilities:
+            for path in vulnerabilities["attack_paths"]:
+                if (host_entry.lower() in path.get("source", "").lower() or
+                    host_entry.lower() in path.get("target", "").lower()):
+                    src = path.get("source", "")
+                    rel = path.get("relationship", "")
+                    tgt = path.get("target", "")
+                    risk = path.get("risk", "")
+                    bloodhound_findings.append(f"- {src} **{rel}** {tgt} (_risk: {risk}_)")
+
+        body_lines = [
+            f"**Host:** {host_entry}",
+            "",
+            "## BloodHound Findings",
+            "",
+        ]
+
+        if bloodhound_findings:
+            body_lines.extend(bloodhound_findings)
+        else:
+            body_lines.append("_No direct findings for this host._")
+
+        body_lines += ["", OPERATOR_NOTES_SENTINEL, OPERATOR_NOTES_HINT]
+        if existing_op_notes:
+            body_lines += ["", existing_op_notes]
+
+        body = "\n".join(body_lines)
+        host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+
+        if existed:
+            hosts_updated += 1
+        else:
+            hosts_created += 1
+
+    # Rebuild canvas with BloodHound scan card
+    existing_scan_host_map = _read_existing_scan_host_map(vault_dir)
+    bloodhound_hosts = [_safe_filename(h) for h in unique_hosts]
+    combined_scan_host_map = existing_scan_host_map.copy()
+    combined_scan_host_map[scan_stem] = bloodhound_hosts
+
+    all_analyses = [(scan_name, report_text)] if report_text else []
+    build_canvas(vault_dir, CANVAS_FILENAME, combined_scan_host_map, all_analyses)
+
+    canvas_path = vault_dir / CANVAS_FILENAME
+    result = {
+        "vault_dir": str(vault_dir),
+        "scan_note": str(scan_path),
+        "canvas": str(canvas_path),
+        "hosts_created": hosts_created,
+        "hosts_updated": hosts_updated,
+        "total_hosts": len(unique_hosts),
+    }
+
+    logger.info(
+        f"BloodHound export complete — {hosts_created} created, {hosts_updated} updated, "
+        f"scan note: {scan_path.name}"
+    )
+    return result
+
+
+# ============================================================
+# Volatility export
+# ============================================================
+
+def export_volatility_to_obsidian(
+    vault_dir: Path,
+    analysis_text: str,
+    target_host: str,
+    scan_name: str = "Volatility",
+    model_name: Optional[str] = None,
+) -> dict:
+    """
+    Export Volatility memory forensics analysis to Obsidian vault.
+
+    - Creates Scans/<scan_stem>.md with analysis_text
+    - Creates/updates host note for target_host
+    - Adds volatility_max_severity to frontmatter based on analysis severity
+    - Rebuilds canvas with Volatility scan card included
+    """
+    logger.info(f"Starting Volatility export → {vault_dir}")
+
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    (vault_dir / "Hosts").mkdir(exist_ok=True)
+    (vault_dir / "Scans").mkdir(exist_ok=True)
+
+    scan_stem = _safe_filename(f"{scan_name} - Volatility")
+    scan_path = vault_dir / "Scans" / _ensure_md(scan_stem)
+
+    # Build scan note
+    lines = [
+        f"# {scan_name} — Volatility Memory Forensics",
+        "",
+        f"- **Target Host:** {target_host}",
+        f"- **Parsed:** {dt.datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "## Analysis",
+        "",
+    ]
+
+    if model_name:
+        lines.append(f"_Model: {model_name}_\n")
+
+    lines.append(analysis_text)
+    scan_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info(f"Wrote Volatility scan note: {scan_path.name}")
+
+    # Create/update host note for target
+    host_stem = _safe_filename(target_host)
+    host_path = vault_dir / "Hosts" / _ensure_md(host_stem)
+    existed = host_path.exists()
+
+    # Read existing frontmatter
+    existing_fm: dict = {}
+    existing_op_notes = ""
+    if existed:
+        old_text = host_path.read_text(encoding="utf-8")
+        existing_fm, old_body = read_frontmatter(old_text)
+        existing_op_notes = extract_operator_notes(old_body)
+
+    # Merge frontmatter
+    merged_sources = existing_fm.get("sources", [])
+    if scan_name not in merged_sources:
+        merged_sources = merged_sources + [scan_name]
+
+    # Determine severity from analysis_text
+    volatility_max_severity = "unknown"
+    if "CRITICAL" in analysis_text.upper():
+        volatility_max_severity = "critical"
+    elif "HIGH" in analysis_text.upper():
+        volatility_max_severity = "high"
+    elif "MEDIUM" in analysis_text.upper():
+        volatility_max_severity = "medium"
+
+    merged_tags = sorted(set(existing_fm.get("tags", [])) | {"memory-forensics"})
+
+    fm = {
+        "ip": existing_fm.get("ip"),
+        "hostnames": existing_fm.get("hostnames", [target_host]),
+        "status": existing_fm.get("status", "not-started"),
+        "tags": merged_tags,
+        "sources": merged_sources,
+        "volatility_max_severity": volatility_max_severity,
+    }
+
+    # Build body with Volatility findings summary
+    summary = analysis_text[:800] if len(analysis_text) > 800 else analysis_text
+
+    # Extract critical/high findings
+    critical_lines = [l.strip() for l in analysis_text.splitlines()
+                      if "CRITICAL" in l.upper() or "HIGH" in l.upper()]
+
+    body_lines = [
+        f"**Host:** {target_host}",
+        f"**Severity:** {volatility_max_severity.upper()}",
+        "",
+        "## Volatility Analysis",
+        "",
+    ]
+
+    if critical_lines:
+        body_lines.append("### Critical Findings")
+        body_lines.extend(f"- {line}" for line in critical_lines[:10])
+        body_lines.append("")
+
+    body_lines += [
+        "### Summary",
+        summary,
+        "",
+        OPERATOR_NOTES_SENTINEL,
+        OPERATOR_NOTES_HINT,
+    ]
+
+    if existing_op_notes:
+        body_lines += ["", existing_op_notes]
+
+    body = "\n".join(body_lines)
+    host_path.write_text(write_frontmatter(fm) + "\n" + body, encoding="utf-8")
+
+    hosts_created = 0 if existed else 1
+    hosts_updated = 1 if existed else 0
+
+    # Rebuild canvas with Volatility scan card
+    existing_scan_host_map = _read_existing_scan_host_map(vault_dir)
+    combined_scan_host_map = existing_scan_host_map.copy()
+    combined_scan_host_map[scan_stem] = [host_stem]
+
+    all_analyses = [(scan_name, analysis_text)] if analysis_text else []
+    build_canvas(vault_dir, CANVAS_FILENAME, combined_scan_host_map, all_analyses)
+
+    canvas_path = vault_dir / CANVAS_FILENAME
+    result = {
+        "vault_dir": str(vault_dir),
+        "scan_note": str(scan_path),
+        "canvas": str(canvas_path),
+        "hosts_created": hosts_created,
+        "hosts_updated": hosts_updated,
+        "total_hosts": 1,
+    }
+
+    logger.info(
+        f"Volatility export complete — {hosts_created} created, {hosts_updated} updated, "
+        f"scan note: {scan_path.name}"
+    )
+    return result
 
 
 # ============================================================
